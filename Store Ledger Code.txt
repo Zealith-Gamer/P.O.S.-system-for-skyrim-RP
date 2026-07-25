@@ -1,0 +1,1085 @@
+// ==========================================
+// CONFIGURATION: PASTE YOUR TREASURY ID HERE
+// ==========================================
+const TREASURY_ID = "xxx";
+
+// Returns the global Treasury Database spreadsheet object.
+function getTreasuryDb() {
+  return SpreadsheetApp.openById(TREASURY_ID);
+}
+
+// Watches the spreadsheet for user alterations, checkboxes, or raw IDs.
+function installedMasterRouter(e) {
+  const range = e.range;
+  const sheet = range.getSheet();
+  const sheetName = sheet.getName().toLowerCase();
+  const row = range.getRow();
+  const col = range.getColumn();
+  const val = range.getValue();
+
+  console.log(`${sheetName} ${col},${row} is ${val}`);
+
+  // A. AUTOMATIC ITEM ID LOOKUPS
+  if (col === 1 && row >= 6 && sheetName.includes("order_form")) {
+    if (val !== "") {
+      fetchItemDetails(sheet, row, val, "Order");
+    } else {
+      // OPTIMIZATION: Batched clearing using RangeList
+      const rangeList = [
+        `B${row}`, `D${row}`, `F${row}`, `I${row}:L${row}`
+      ];
+      sheet.getRangeList(rangeList).clearContent();
+    }
+    return;
+  }
+  
+  if (val !== "" && col === 2 && row >= 5 && sheetName.includes("trading")) {
+    fetchItemDetails(sheet, row, val, "Trading");
+    return;
+  }
+
+  // C. AUTOMATIC INVENTORY SEARCH ROUTING
+  if (sheetName.includes("inventory") && row === 2 && col === 2) {
+    renderInventoryPortal(sheet);
+    return;
+  }
+
+  // B. SECURITY CHECKBOX ROUTING
+  if (val === true) {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const ownerEmail = spreadsheet.getOwner() ? spreadsheet.getOwner().getEmail() : "";
+    const activeUserEmail = Session.getActiveUser().getEmail();
+
+    if (sheetName.includes("order_form") && row === 3 && col === 2) {
+      const clerk = sheet.getRange("B2").getValue();
+      if (!isEmailValid(clerk, activeUserEmail, ownerEmail)) {
+        sheet.getRange(row, col).setValue(false);
+        SpreadsheetApp.getUi().alert(`🔮 *The ledger's ink turns to ash!* \n\n"Halt, interloper! The signature of '${clerk}' is not bound to the standing stones of this forge. Access denied!"`);
+        return;
+      }
+      submitMerchantOrder(sheet);
+    } 
+    else if (sheetName.includes("trading") && row === 3 && col === 3) {
+      const clerk = sheet.getRange("C2").getValue();
+      if (!isEmailValid(clerk, activeUserEmail, ownerEmail)) {
+        sheet.getRange(row, col).setValue(false);
+        SpreadsheetApp.getUi().alert(`🔮 *The ledger's ink turns to ash!* \n\n"Halt, interloper! The signature of '${clerk}' is not bound to the standing stones of this forge. Access denied!"`);
+        return;
+      }
+      processInventoryAdjustment(sheet);
+    } 
+    else if (sheetName.includes("fulfillment")) {
+      sheet.getRange(row, col).setValue(false);
+      if (row === 1 && col === 2) pullForgeQueue(sheet);
+      else if (row === 2 && col === 2) pushForgeQueue(sheet);
+      else if (row === 1 && col === 12) processForgeCrafting(sheet);
+    } 
+    else if (sheetName.includes("payout") && row === 4 && col === 2) {
+      const staff = sheet.getRange("B1").getValue();
+      if (!isEmailValid(staff, activeUserEmail, ownerEmail)) {
+        sheet.getRange(row, col).setValue(false);
+        SpreadsheetApp.getUi().alert(`🔮 *The ledger's ink turns to ash!* \n\n"Halt, interloper! The signature of '${staff}' is not bound to the standing stones of this forge. Access denied!"`);
+        return;
+      }
+      withdrawCommissionGold(sheet);
+    }
+  }
+}
+
+// Validates active Google user session against the secure backend user registry.
+function isEmailValid(staffName, activeUserEmail, ownerEmail) {
+  if (activeUserEmail.toLowerCase() === ownerEmail.toLowerCase()) return true;
+
+  const db = getTreasuryDb();
+  const userSheet = db.getSheetByName("Users");
+  const lastRow = userSheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const data = userSheet.getRange(2, 2, lastRow - 1, 7).getValues();
+
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === staffName) {
+      const isActive = data[i][6] === true;
+      if (!isActive) return false;
+
+      const registeredEmail = data[i][5] ? data[i][5].toString().trim().toLowerCase() : "";
+      return activeUserEmail.toLowerCase() === registeredEmail;
+    }
+  }
+  return false;
+}
+
+// Resolves active user session email against the Users backend sheet to fetch Staff Name
+function getStaffNameByEmail(db, activeUserEmail, ownerEmail) {
+  if (ownerEmail && activeUserEmail.toLowerCase() === ownerEmail.toLowerCase()) {
+    return "Dar'Ziil";
+  }
+
+  const userSheet = db.getSheetByName("Users");
+  if (!userSheet) return null;
+  const lastRow = userSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const data = userSheet.getRange(2, 2, lastRow - 1, 7).getValues();
+  for (let i = 0; i < data.length; i++) {
+    const staffName = data[i][0];
+    const registeredEmail = data[i][5] ? data[i][5].toString().trim().toLowerCase() : "";
+    const isActive = data[i][6] === true;
+
+    if (isActive && registeredEmail === activeUserEmail.toLowerCase()) {
+      return staffName;
+    }
+  }
+  return null;
+}
+
+// Extracts commission cut rates for all active registered users.
+function getUserCommissionMap(db) {
+  const userSheet = db.getSheetByName("Users");
+  const lastRow = userSheet.getLastRow();
+  if (lastRow < 2) return {};
+
+  const data = userSheet.getRange(2, 2, lastRow - 1, 7).getValues();
+  const commMap = {};
+
+  for (let i = 0; i < data.length; i++) {
+    const staffName = data[i][0];
+    const isActive = data[i][6] === true;
+
+    if (staffName && isActive) {
+      commMap[staffName] = Number(data[i][3]) || 0;
+    }
+  }
+  return commMap;
+}
+
+// Adjusts the saved withdrawable coin balance inside a user's ledger file.
+function adjustUserCommissionBalance(db, staffName, goldAmount) {
+  if (!staffName || goldAmount === 0) return;
+  const userSheet = db.getSheetByName("Users");
+  const lastRow = userSheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = userSheet.getRange(2, 2, lastRow - 1, 5);
+  const values = range.getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    if (values[i][0] === staffName) {
+      const currentBalance = Number(values[i][4]) || 0;
+      userSheet.getRange(i + 2, 6).setValue(currentBalance + goldAmount);
+      break;
+    }
+  }
+}
+
+// Accepts optional existing db reference or pre-fetched patterns array
+function parseCodeWithSchema(rawId, dbOrPatterns) {
+  if (!rawId) return { schema: "BASE_ONLY", baseId: "", fullId: "" };
+  const cleanId = rawId.toString().trim().toUpperCase();
+  if (!cleanId) return { schema: "BASE_ONLY", baseId: "", fullId: "" };
+
+  try {
+    let patterns = null;
+
+    if (Array.isArray(dbOrPatterns)) {
+      patterns = dbOrPatterns;
+    } else {
+      const db = dbOrPatterns || getTreasuryDb();
+      const schemaSheet = db.getSheetByName("ID_Schema");
+      if (schemaSheet && schemaSheet.getLastRow() >= 2) {
+        patterns = schemaSheet.getRange(2, 1, schemaSheet.getLastRow() - 1, 8).getValues();
+      }
+    }
+
+    if (patterns) {
+      for (let i = 0; i < patterns.length; i++) {
+        const schemaId = patterns[i][0] ? patterns[i][0].toString().trim().toUpperCase() : "";
+        const totalLen = Number(patterns[i][2]);
+        const baseLen = Number(patterns[i][3]) || 4;
+        const patternMask = patterns[i][6] ? patterns[i][6].toString().trim().toUpperCase() : "";
+        const isActive = patterns[i][7] === true;
+
+        if (isActive && cleanId.length === totalLen) {
+          const baseId = cleanId.substring(0, baseLen);
+          const parsedObject = { schema: schemaId, baseId: baseId, fullId: cleanId };
+
+          if (patternMask && patternMask.length === totalLen) {
+            const segments = parseMaskSegments(patternMask);
+            for (let s = 0; s < segments.length; s++) {
+              const seg = segments[s];
+              const value = cleanId.substring(seg.start, seg.start + seg.length);
+
+              parsedObject[seg.token] = value;
+
+              if (seg.token === 'T') parsedObject.type = value;
+              if (seg.token === 'M') parsedObject.material = value;
+              if (seg.token === 'V') parsedObject.variant = value;
+              if (seg.token === 'Q') parsedObject.strength = value;
+              if (seg.token === 'E') parsedObject.enchantment = value;
+              if (seg.token === 'S') parsedObject.sequence = value;
+              if (seg.token === 'B') parsedObject.batch = value;
+            }
+          }
+          return parsedObject;
+        }
+      }
+    }
+  } catch (err) {
+    console.log("Schema mask parsing fallback: " + err.message);
+  }
+
+  const fallbackBaseLen = cleanId.length >= 4 ? 4 : cleanId.length;
+  return { schema: "BASE_ONLY", baseId: cleanId.substring(0, fallbackBaseLen), fullId: cleanId };
+}
+
+// Helper utility: Groups contiguous repeating mask characters
+function parseMaskSegments(mask) {
+  const segments = [];
+  if (!mask) return segments;
+
+  let currentChar = mask[0];
+  let startIdx = 0;
+  let count = 1;
+
+  for (let i = 1; i < mask.length; i++) {
+    if (mask[i] === currentChar) {
+      count++;
+    } else {
+      segments.push({ token: currentChar, start: startIdx, length: count });
+      currentChar = mask[i];
+      startIdx = i;
+      count = 1;
+    }
+  }
+  segments.push({ token: currentChar, start: startIdx, length: count });
+
+  return segments;
+}
+
+// Fetches and parses recipe components for a Base ID
+function getRecipeForBaseId(db, baseId) {
+  const recipeSheet = db.getSheetByName("Recipes");
+  if (!recipeSheet) return null;
+
+  const lastRow = recipeSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const data = recipeSheet.getRange(2, 1, lastRow - 1, 11).getValues();
+  const cleanBaseId = baseId.toString().trim().toUpperCase();
+
+  for (let i = 0; i < data.length; i++) {
+    const outputId = data[i][0].toString().trim().toUpperCase();
+    const parsedOutput = parseCodeWithSchema(outputId, db);
+    const targetBase = parsedOutput ? parsedOutput.baseId : outputId;
+
+    if (targetBase === cleanBaseId || outputId === cleanBaseId) {
+      const yieldQty = Number(data[i][2]) || 1;
+      const ingredients = [];
+
+      for (let col = 3; col <= 10; col++) {
+        const entry = data[i][col] ? data[i][col].toString().trim() : "";
+
+        if (entry !== "" && entry.includes("(") && entry.includes(")")) {
+          const matId = entry.substring(0, entry.indexOf("(")).trim().toUpperCase();
+          const matQty = Number(entry.substring(entry.indexOf("(") + 1, entry.indexOf(")"))) || 0;
+
+          if (matId && matQty > 0) {
+            ingredients.push({ id: matId, qty: matQty });
+          }
+        }
+      }
+      return { outputId: outputId, yieldQty: yieldQty, ingredients: ingredients };
+    }
+  }
+  return null;
+}
+
+// Deducts raw recipe materials from Inventory in a batched process
+function deductCraftingMaterials(db, fullItemId, orderQty) {
+  if (!fullItemId) return;
+
+  const cleanId = fullItemId.toString().trim().toUpperCase();
+  const parsed = parseCodeWithSchema(cleanId, db);
+  const baseId = parsed ? parsed.baseId : cleanId;
+
+  const recipe = getRecipeForBaseId(db, baseId);
+  const batchUpdates = {};
+
+  if (recipe && recipe.ingredients.length > 0) {
+    const batches = Math.ceil(orderQty / recipe.yieldQty);
+    for (let k = 0; k < recipe.ingredients.length; k++) {
+      const ing = recipe.ingredients[k];
+      batchUpdates[ing.id] = -(ing.qty * batches);
+    }
+  } else {
+    batchUpdates[fullItemId] = -orderQty;
+  }
+  
+  processBatchInventoryUpdates(db, batchUpdates);
+}
+
+// Pulls baseline values from Master_Prices using ID_Schema base ID lookups
+function fetchItemDetails(sheet, row, itemId, type) {
+  try {
+    const db = getTreasuryDb();
+    const priceSheet = db.getSheetByName("Master_Prices");
+    const priceLastRow = priceSheet.getLastRow();
+    if (priceLastRow < 2) return;
+
+    const data = priceSheet.getRange(2, 1, priceLastRow - 1, 5).getValues();
+    const parsedInput = parseCodeWithSchema(itemId, db);
+    const baseId = parsedInput ? parsedInput.baseId : itemId.toString().trim().toUpperCase();
+
+    for (let i = 0; i < data.length; i++) {
+      const rawMasterId = data[i][0].toString().trim().toUpperCase();
+      const parsedMaster = parseCodeWithSchema(rawMasterId, db);
+      const masterBaseId = parsedMaster ? parsedMaster.baseId : rawMasterId;
+
+      if (masterBaseId === baseId) {
+        if (type === "Order") {
+          sheet.getRange(row, 2).setValue(data[i][1]); // Item Name
+          sheet.getRange(row, 4).setValue(data[i][4]); // Sell Price
+          sheet.getRange(row, 6).setValue(data[i][4]); // Fallback Price
+        } else if (type === "Trading") {
+          sheet.getRange(row, 3).setValue(data[i][1]); // Item Name
+          const actionType = sheet.getRange(row, 1).getValue().toString().toUpperCase().trim();
+          sheet.getRange(row, 6).setValue(actionType.includes("BUY") ? data[i][3] : data[i][4]);
+        }
+        return;
+      }
+    }
+  } catch (err) {
+    console.log("Lookup failed: " + err.message);
+  }
+}
+
+// Packages customer orders with schema-aware Base ID resolution
+function submitMerchantOrder(orderSheet) {
+  const db = getTreasuryDb();
+  const ledgerSheet = db.getSheetByName("Transaction_Ledger");
+
+  const customer = orderSheet.getRange("B1").getValue();
+  const clerk = orderSheet.getRange("B2").getValue();
+
+  if (!customer || !clerk) {
+    SpreadsheetApp.getUi().alert("🔮 *The manuscript flashes crimson!* \n\n\"The ledger demands names! Write the identity of both Clerk and Client upon the line, or the coin-bonds cannot be cast.\"");
+    orderSheet.getRange("B3").setValue(false);
+    return;
+  }
+
+  const commMap = getUserCommissionMap(db);
+  const clerkRate = commMap[clerk] || 0;
+  const orderId = `ORD-${new Date().getTime()}`;
+  const timestamp = new Date();
+
+  const orderValues = orderSheet.getRange("A6:L20").getValues();
+  const priceSheet = db.getSheetByName("Master_Prices");
+  const priceValues = priceSheet.getRange(2, 1, priceSheet.getLastRow() - 1, 5).getValues();
+
+  const catalogMap = {};
+  for (let p = 0; p < priceValues.length; p++) {
+    const rawMasterId = priceValues[p][0].toString().trim().toUpperCase();
+    const parsedMaster = parseCodeWithSchema(rawMasterId, db);
+    const basePriceId = parsedMaster ? parsedMaster.baseId : rawMasterId;
+    if (basePriceId) {
+      catalogMap[basePriceId] = {
+        name: priceValues[p][1],
+        cost: Number(priceValues[p][3]) || 0,
+        sell: Number(priceValues[p][4]) || 0
+      };
+    }
+  }
+
+  const transactionsToAppend = [];
+  let totalClerkEarnings = 0;
+  let totalOrderProfit = 0;
+
+  for (let i = 0; i < orderValues.length; i++) {
+    const rawId = orderValues[i][0];
+    const qty = Number(orderValues[i][2]) || 0;
+
+    if (rawId && qty > 0) {
+      const cleanId = rawId.toString().trim().toUpperCase();
+      const parsed = parseCodeWithSchema(cleanId, db);
+      const baseId = parsed ? parsed.baseId : cleanId;
+      const rates = catalogMap[baseId];
+
+      const unitCost = rates ? rates.cost : 0;
+      const unitPrice = Number(orderValues[i][3]) || (rates ? rates.sell : 0);
+      const haggledPrice = Number(orderValues[i][4]) || 0;
+
+      const rawColL = orderValues[i][11];
+      const enchantCost = typeof rawColL === "number" ? rawColL : (Number(rawColL) || 0);
+      const enchantmentNote = (typeof rawColL === "string" && isNaN(Number(rawColL)) && rawColL !== "") ? rawColL : "none";
+
+      const baseUnitPrice = (haggledPrice > 0) ? haggledPrice : unitPrice;
+      const finalUnitPrice = baseUnitPrice + enchantCost;
+
+      const totalPrice = qty * finalUnitPrice;
+      const totalCost = qty * unitCost;
+      const totalProfit = totalPrice - totalCost;
+
+      totalOrderProfit += totalProfit;
+      let fullItemId = cleanId;
+
+      // Construct weapon ID if input is a 4-char Base ID
+      if (cleanId.length === 4) {
+        let variant = orderValues[i][8] !== "" ? orderValues[i][8].toString().trim() : "00";
+        if (variant.length === 1) variant = "0" + variant;
+        const strength = orderValues[i][9] !== "" ? orderValues[i][9].toString().trim() : "0";
+        const enchantCode = orderValues[i][10] !== "" ? orderValues[i][10].toString().toUpperCase().trim() : "N";
+        fullItemId = baseId + variant + strength + enchantCode;
+      }
+
+      const clerkComm = totalPrice * clerkRate;
+      totalClerkEarnings += clerkComm;
+
+      transactionsToAppend.push([timestamp, orderId, customer, clerk, fullItemId, qty, totalPrice, totalCost, totalProfit, "Pending", "", clerkComm, 0, enchantmentNote]);
+    }
+  }
+
+  if (transactionsToAppend.length > 0) {
+    // OPTIMIZATION: Batched append
+    ledgerSheet.getRange(ledgerSheet.getLastRow() + 1, 1, transactionsToAppend.length, transactionsToAppend[0].length).setValues(transactionsToAppend);
+    adjustUserCommissionBalance(db, clerk, totalClerkEarnings);
+    applyTransactionTaxes(db, orderId, totalOrderProfit, timestamp);
+  }
+
+  orderSheet.getRangeList(['B1', 'A6:F20', 'I6:L20']).clearContent();
+  orderSheet.getRange("B3").setValue(false);
+  SpreadsheetApp.getUi().alert("🔮 *A resonant chime echoes from the binding...* \n\n\"The transaction is sealed! The custom weapon order has been bound to the permanent ledger vault. May the forge guide your hammer.\"");
+}
+
+// Logs over-the-counter trades, constructs 8-digit IDs, and adjusts/appends inventory stock
+function processInventoryAdjustment(portalSheet) {
+  const db = getTreasuryDb();
+  const ledgerSheet = db.getSheetByName("Transaction_Ledger");
+  const priceSheet = db.getSheetByName("Master_Prices");
+  const clerk = portalSheet.getRange("C2").getValue();
+  const lastRow = portalSheet.getLastRow();
+
+  if (!clerk || lastRow < 5) {
+    portalSheet.getRange("C3").setValue(false);
+    showKhajiitAlert(!clerk ? "UNAUTHORIZED_ACCESS" : "INVALID_INPUT");
+    return;
+  }
+
+  const commMap = getUserCommissionMap(db);
+  const clerkRate = commMap[clerk] || 0;
+  const values = portalSheet.getRange(5, 1, lastRow - 4, 5).getValues();
+  const entriesToLog = [];
+  const timestamp = new Date();
+  const transactionId = `LOG-${timestamp.getTime()}`;
+  let totalClerkEarnings = 0;
+  let totalBatchProfit = 0;
+  const batchInvUpdates = {};
+
+  const priceValues = priceSheet.getRange(2, 1, priceSheet.getLastRow() - 1, 5).getValues();
+  const catalogMap = {};
+  for (let p = 0; p < priceValues.length; p++) {
+    const rawPriceId = priceValues[p][0].toString().trim().toUpperCase();
+    const parsedPrice = parseCodeWithSchema(rawPriceId, db);
+    const basePriceId = parsedPrice ? parsedPrice.baseId : rawPriceId;
+    catalogMap[basePriceId] = { 
+      name: priceValues[p][1],
+      cost: Number(priceValues[p][3]) || 0, 
+      sell: Number(priceValues[p][4]) || 0 
+    };
+  }
+
+  for (let i = 0; i < values.length; i++) {
+    const action = values[i][0] ? values[i][0].toString().toUpperCase().trim() : "";
+    const rawItemId = values[i][1];
+    const qty = Number(values[i][3]) || 0;
+    const hagglePrice = values[i][4];
+
+    if (action && rawItemId && qty > 0) {
+      const cleanId = rawItemId.toString().trim().toUpperCase();
+      const parsedItem = parseCodeWithSchema(cleanId, db);
+      const lookupBase = parsedItem ? parsedItem.baseId : cleanId;
+      const rates = catalogMap[lookupBase];
+      if (!rates) continue;
+
+      // Ensure 8-digit schema for weapons/gear (TTTVQEN) if a 4-char Base ID was entered
+      let fullItemId = cleanId;
+      if (cleanId.length === 4) {
+        fullItemId = `${cleanId}000N`;
+      }
+
+      let totalPrice = 0, totalCost = 0, totalProfit = 0, statusFlag = "";
+
+      if (action.includes("BUY")) {
+        const unitCost = (Number(hagglePrice) > 0) ? Number(hagglePrice) : rates.cost;
+        totalCost = qty * unitCost; 
+        totalProfit = -totalCost; 
+        statusFlag = "Bought";
+
+        if (!batchInvUpdates[fullItemId]) {
+          batchInvUpdates[fullItemId] = { qty: 0, name: rates.name || "Unknown Item" };
+        }
+        batchInvUpdates[fullItemId].qty += qty;
+
+      } else if (action.includes("SELL")) {
+        const unitSell = (Number(hagglePrice) > 0) ? Number(hagglePrice) : rates.sell;
+        totalPrice = qty * unitSell; 
+        totalCost = qty * rates.cost; 
+        totalProfit = totalPrice - totalCost; 
+        statusFlag = "Sold";
+
+        if (!batchInvUpdates[fullItemId]) {
+          batchInvUpdates[fullItemId] = { qty: 0, name: rates.name || "Unknown Item" };
+        }
+        batchInvUpdates[fullItemId].qty -= qty;
+      }
+
+      if (totalProfit > 0) totalBatchProfit += totalProfit;
+
+      const clerkComm = action.includes("SELL") ? (totalPrice * clerkRate) : 0;
+      totalClerkEarnings += clerkComm;
+      entriesToLog.push([timestamp, transactionId, "Direct Trade", clerk, fullItemId, qty, totalPrice, totalCost, totalProfit, statusFlag, "N/A", clerkComm, 0, "none"]);
+    }
+  }
+
+  if (entriesToLog.length > 0) {
+    ledgerSheet.getRange(ledgerSheet.getLastRow() + 1, 1, entriesToLog.length, entriesToLog[0].length).setValues(entriesToLog);
+    processBatchInventoryUpdates(db, batchInvUpdates);
+    adjustUserCommissionBalance(db, clerk, totalClerkEarnings);
+    applyTransactionTaxes(db, transactionId, totalBatchProfit, timestamp);
+    showKhajiitAlert("HAGGLE_SUCCESS");
+  } else {
+    showKhajiitAlert("INVALID_INPUT");
+  }
+
+  // Preserve Row 5; clear content starting from Row 6 onwards
+  if (lastRow >= 6) {
+    portalSheet.getRange(6, 1, lastRow - 5, 6).clearContent();
+  }
+  portalSheet.getRange("C3").setValue(false);
+}
+
+// Retrieves all pending orders from the vault to populate the on-screen forge checklist.
+function pullForgeQueue(dashSheet) {
+  const db = getTreasuryDb();
+  const ledgerSheet = db.getSheetByName("Transaction_Ledger");
+  const priceSheet = db.getSheetByName("Master_Prices");
+
+  const dashLastRow = dashSheet.getLastRow();
+  if (dashLastRow >= 4) {
+    dashSheet.getRange(4, 1, dashLastRow - 3, 9).clearContent();
+  }
+
+  const priceValues = priceSheet.getRange(2, 1, priceSheet.getLastRow() - 1, 2).getValues();
+  const nameMap = {};
+  for (let p = 0; p < priceValues.length; p++) {
+    if (priceValues[p][0]) {
+      const rawPriceId = priceValues[p][0].toString().trim().toUpperCase();
+      const parsedPrice = parseCodeWithSchema(rawPriceId, db);
+      const basePriceId = parsedPrice ? parsedPrice.baseId : rawPriceId;
+      nameMap[basePriceId] = priceValues[p][1];
+    }
+  }
+
+  const ledgerLastRow = ledgerSheet.getLastRow();
+  if (ledgerLastRow < 2) {
+    SpreadsheetApp.getUi().alert("⚒️ *The anvil is silent...* \n\n\"No orders linger in the grand ledger archives, Overseer. The fires burn cold.\"");
+    return;
+  }
+
+  const ledgerValues = ledgerSheet.getRange(2, 1, ledgerLastRow - 1, 14).getValues();
+  const pendingRows = [];
+
+  for (let j = 0; j < ledgerValues.length; j++) {
+    if (ledgerValues[j][9] === "Pending") {
+      const enchantVal = ledgerValues[j][13] || "none";
+      const fullLedgerId = ledgerValues[j][4].toString();
+      const parsedLedger = parseCodeWithSchema(fullLedgerId, db);
+      const baseLedgerId = parsedLedger ? parsedLedger.baseId : fullLedgerId;
+
+      pendingRows.push([
+        ledgerValues[j][1],
+        ledgerValues[j][2],
+        nameMap[baseLedgerId] || fullLedgerId,
+        fullLedgerId,
+        ledgerValues[j][5],
+        enchantVal,
+        ledgerValues[j][10],
+        ledgerValues[j][9],
+        (j + 2)
+      ]);
+    }
+  }
+
+  if (pendingRows.length > 0) {
+    dashSheet.getRange(4, 1, pendingRows.length, 9).setValues(pendingRows);
+    SpreadsheetApp.flush();
+    SpreadsheetApp.getUi().alert("📜 *Smoke rises from the parchment...* \n\n\"The forge manifests the backlog of the realm! Pending works are laid bare upon the order-slate. To the hammers!\"");
+  } else {
+    SpreadsheetApp.getUi().alert("⚒️ *The anvil is silent...* \n\n\"No pending orders linger in the grand ledger archives, Overseer. The fires burn cold.\"");
+  }
+}
+
+// Commits finished orders, pays out commissions, and deducts raw recipe stock from Inventory ONLY on Completion.
+function pushForgeQueue(dashSheet) {
+  const db = getTreasuryDb();
+  const ledgerSheet = db.getSheetByName("Transaction_Ledger");
+  const commMap = getUserCommissionMap(db);
+  const dashLastRow = dashSheet.getLastRow();
+
+  if (dashLastRow < 4) {
+    SpreadsheetApp.getUi().alert("⚠️ *The work-slate is bare!* \n\n\"There are no orders inscribed here to bind to the grand ledger, master.\"");
+    return;
+  }
+
+  const dashValues = dashSheet.getRange(4, 1, dashLastRow - 3, 9).getValues();
+
+  for (let i = 0; i < dashValues.length; i++) {
+    const updatedItemId = dashValues[i][3];
+    const updatedEnchantNote = dashValues[i][5];
+    const blacksmith = dashValues[i][6];
+    const status = dashValues[i][7];
+    const ledgerRowNum = dashValues[i][8];
+
+    if (ledgerRowNum) {
+      if (updatedItemId) {
+        ledgerSheet.getRange(ledgerRowNum, 5).setValue(updatedItemId.toString().toUpperCase().trim());
+      }
+      if (updatedEnchantNote) {
+        ledgerSheet.getRange(ledgerRowNum, 14).setValue(updatedEnchantNote.toString().trim());
+      }
+
+      const currentLedgerStatus = ledgerSheet.getRange(ledgerRowNum, 10).getValue();
+
+      // MATERIAL DEDUCTION RULE: Only deduct stock when changing from Pending -> Complete
+      if (status === "Complete" && currentLedgerStatus === "Pending") {
+        const totalPrice = ledgerSheet.getRange(ledgerRowNum, 7).getValue();
+        const smithComm = totalPrice * (commMap[blacksmith] || 0);
+
+        ledgerSheet.getRange(ledgerRowNum, 10).setValue("Complete");
+        ledgerSheet.getRange(ledgerRowNum, 11).setValue(blacksmith);
+        ledgerSheet.getRange(ledgerRowNum, 13).setValue(smithComm);
+
+        adjustUserCommissionBalance(db, blacksmith, smithComm);
+
+        const orderQty = Number(ledgerSheet.getRange(ledgerRowNum, 6).getValue()) || 0;
+        const orderedItemId = ledgerSheet.getRange(ledgerRowNum, 5).getValue();
+
+        deductCraftingMaterials(db, orderedItemId, orderQty);
+      } else {
+        ledgerSheet.getRange(ledgerRowNum, 10).setValue(status);
+        ledgerSheet.getRange(ledgerRowNum, 11).setValue(blacksmith);
+      }
+    }
+  }
+
+  dashSheet.getRange(4, 1, dashLastRow - 3, 9).clearContent();
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert("⚔️ *The forge roars as the metal cools!* \n\n\"The updates have been permanently quenched! Raw materials have been deducted from inventory for all completed works.\"");
+}
+
+// Executes stock crafting, smelting, and ammo conversion (Cols K-O, Row 6+)
+function processForgeCrafting(forgeSheet) {
+  const db = getTreasuryDb();
+  const ledgerSheet = db.getSheetByName("Transaction_Ledger");
+  const invSheet = db.getSheetByName("Inventory");
+  
+  const activeUserEmail = Session.getActiveUser().getEmail();
+  const ownerEmail = SpreadsheetApp.getActiveSpreadsheet().getOwner() ? SpreadsheetApp.getActiveSpreadsheet().getOwner().getEmail() : "";
+  const defaultSmith = getStaffNameByEmail(db, activeUserEmail, ownerEmail);
+
+  if (!defaultSmith) {
+    forgeSheet.getRange("L1").setValue(false);
+    showKhajiitAlert("UNAUTHORIZED_ACCESS");
+    return;
+  }
+
+  const lastRow = forgeSheet.getLastRow();
+  if (lastRow < 6) {
+    forgeSheet.getRange("L1").setValue(false);
+    showKhajiitAlert("INVALID_INPUT");
+    return;
+  }
+
+  // Read data grid starting at K6:O (Col 11 to Col 15, 5 columns)
+  const values = forgeSheet.getRange(6, 11, lastRow - 5, 5).getValues();
+  const timestamp = new Date();
+  const transactionId = `FORGE-${timestamp.getTime()}`;
+  
+  const entriesToLog = [];
+  const batchInvUpdates = {};
+
+  // Fetch current backend inventory levels into memory for pre-validation
+  const invLastRow = invSheet.getLastRow();
+  const invData = invLastRow >= 2 ? invSheet.getRange(2, 1, invLastRow - 1, 3).getValues() : [];
+  const currentStockMap = new Map();
+  
+  for (let k = 0; k < invData.length; k++) {
+    const rawId = invData[k][0] ? invData[k][0].toString().toUpperCase().trim() : "";
+    if (rawId) {
+      currentStockMap.set(rawId, Number(invData[k][2]) || 0);
+    }
+  }
+
+  // Phase 1: Process inputs and calculate ingredient adjustments
+  for (let i = 0; i < values.length; i++) {
+    const lineSmith = values[i][0] ? values[i][0].toString().trim() : defaultSmith;
+    const opType = values[i][1] ? values[i][1].toString().trim() : "";
+    const rawId = values[i][2] ? values[i][2].toString().toUpperCase().trim() : "";
+    const qty = Number(values[i][3]) || 0;
+    const spec = values[i][4] ? values[i][4].toString().toUpperCase().trim() : "000N";
+
+    if (!opType || !rawId || qty <= 0) continue;
+
+    const parsed = parseCodeWithSchema(rawId, db);
+    const baseId = parsed ? parsed.baseId : rawId;
+    const recipe = getRecipeForBaseId(db, baseId);
+
+    if (!recipe) {
+      showKhajiitAlert("RECIPE_NOT_FOUND");
+      forgeSheet.getRange("L1").setValue(false);
+      return;
+    }
+
+    // Expand 4-char Base IDs to full 8-digit constructed ID
+    let fullOutputId = rawId;
+    if (rawId.length === 4) {
+      fullOutputId = baseId + (spec.length === 4 ? spec : "000N");
+    }
+
+    const batches = Math.ceil(qty / recipe.yieldQty);
+    const actualProducedQty = batches * recipe.yieldQty;
+
+    // Add produced item
+    if (!batchInvUpdates[fullOutputId]) batchInvUpdates[fullOutputId] = 0;
+    batchInvUpdates[fullOutputId] += actualProducedQty;
+
+    // Deduct recipe ingredients
+    for (let j = 0; j < recipe.ingredients.length; j++) {
+      const ing = recipe.ingredients[j];
+      const requiredTotal = ing.qty * batches;
+
+      if (!batchInvUpdates[ing.id]) batchInvUpdates[ing.id] = 0;
+      batchInvUpdates[ing.id] -= requiredTotal;
+    }
+
+    // Audit trail log entry using designated line smith
+    entriesToLog.push([
+      timestamp, transactionId, "Forge Production", lineSmith, 
+      fullOutputId, actualProducedQty, 0, 0, 0, 
+      "Complete", lineSmith, 0, 0, `${opType}: ${rawId}`
+    ]);
+  }
+
+  if (Object.keys(batchInvUpdates).length === 0) {
+    forgeSheet.getRange("L1").setValue(false);
+    showKhajiitAlert("INVALID_INPUT");
+    return;
+  }
+
+  // Phase 2: Inventory stock validation before applying updates
+  for (const [itemId, changeQty] of Object.entries(batchInvUpdates)) {
+    if (changeQty < 0) {
+      const required = Math.abs(changeQty);
+      const available = currentStockMap.get(itemId) || 0;
+
+      if (available < required) {
+        showKhajiitAlert("INSUFFICIENT_STOCK");
+        forgeSheet.getRange("L1").setValue(false);
+        return;
+      }
+    }
+  }
+
+  // Phase 3: Commit Batch Updates
+  processBatchInventoryUpdates(db, batchInvUpdates);
+  
+  if (entriesToLog.length > 0) {
+    ledgerSheet.getRange(ledgerSheet.getLastRow() + 1, 1, entriesToLog.length, entriesToLog[0].length).setValues(entriesToLog);
+  }
+
+  // Clear input grid (Cols K-O, starting at Row 6)
+  forgeSheet.getRange(6, 11, lastRow - 5, 5).clearContent();
+  forgeSheet.getRange("L1").setValue(false);
+  
+  showKhajiitAlert("FULFILLMENT_COMPLETE");
+}
+
+// Dispatches a designated volume of gold safely from an employee's commission balance.
+function withdrawCommissionGold(portalSheet) {
+  const db = getTreasuryDb();
+  const payoutLedger = db.getSheetByName("Payout_Ledger");
+  const userSheet = db.getSheetByName("Users");
+
+  const staffName = portalSheet.getRange("B1").getValue();
+  const requestAmount = Number(portalSheet.getRange("B3").getValue()) || 0;
+  let availableBalance = 0;
+
+  const userData = userSheet.getRange(2, 2, userSheet.getLastRow() - 1, 5).getValues();
+  for (let i = 0; i < userData.length; i++) {
+    if (userData[i][0] === staffName) { availableBalance = Number(userData[i][4]) || 0; break; }
+  }
+
+  if (!staffName || requestAmount <= 0 || requestAmount > availableBalance) {
+    portalSheet.getRange("B4").setValue(false);
+    SpreadsheetApp.getUi().alert("🔮 *The vault gates slam shut!* \n\n\"Request denied! Verify your identity or cross-reference your total gold reserves. You cannot withdraw what the vault does not hold.\"");
+    return;
+  }
+
+  payoutLedger.appendRow([new Date(), staffName, requestAmount]);
+  adjustUserCommissionBalance(db, staffName, -requestAmount);
+
+  portalSheet.getRange("B3").clearContent();
+  portalSheet.getRange("B4").setValue(false);
+  SpreadsheetApp.getUi().alert(`🔮 *Heavy steel mechanisms click open...* \n\n"The balance has been extracted! ${requestAmount} Septims have been cleanly dispatched from your personal treasury account. Take your coin and go!"`);
+}
+
+// Renders the entire warehouse inventory stock or filters elements by text criteria.
+function renderInventoryPortal(frontSheet) {
+  const searchQuery = frontSheet.getRange("B2").getValue().toString().trim().toLowerCase();
+  const db = getTreasuryDb();
+  const invSheet = db.getSheetByName("Inventory");
+  const lastRow = invSheet.getLastRow();
+
+  const frontLastRow = frontSheet.getLastRow();
+  if (frontLastRow >= 5) {
+    frontSheet.getRange(5, 1, frontLastRow - 4, 3).clearContent();
+  }
+
+  if (lastRow < 2) return;
+  const data = invSheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  const filteredRows = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const itemId = data[i][0].toString().toLowerCase();
+    const itemName = data[i][1].toString().toLowerCase();
+
+    if (searchQuery === "" || itemId.includes(searchQuery) || itemName.includes(searchQuery)) {
+      filteredRows.push([data[i][0], data[i][1], data[i][2]]);
+    }
+  }
+
+  if (filteredRows.length > 0) {
+    frontSheet.getRange(5, 1, filteredRows.length, 3).setValues(filteredRows);
+  }
+}
+
+// Dynamically updates existing backend stock OR appends missing items to Inventory in batch
+function processBatchInventoryUpdates(db, updatesMap) {
+  if (!updatesMap || Object.keys(updatesMap).length === 0) return;
+  
+  const invSheet = db.getSheetByName("Inventory");
+  if (!invSheet) return;
+  
+  const lastRow = invSheet.getLastRow();
+  const existingData = lastRow >= 2 ? invSheet.getRange(2, 1, lastRow - 1, 3).getValues() : [];
+  
+  const rowIndexMap = new Map();
+  for (let i = 0; i < existingData.length; i++) {
+    const id = existingData[i][0] ? existingData[i][0].toString().toUpperCase().trim() : "";
+    if (id) {
+      rowIndexMap.set(id, i);
+    }
+  }
+
+  const rowsToAppend = [];
+
+  for (const [rawKey, payload] of Object.entries(updatesMap)) {
+    const cleanId = rawKey.toString().toUpperCase().trim();
+    let qtyChange = 0;
+    let itemName = "Unknown Item";
+
+    if (typeof payload === "object" && payload !== null) {
+      qtyChange = Number(payload.qty) || 0;
+      itemName = payload.name || itemName;
+    } else {
+      qtyChange = Number(payload) || 0;
+    }
+
+    if (qtyChange === 0) continue;
+
+    // 1. Exact ID Match (Supports 8-digit constructed weapon IDs)
+    if (rowIndexMap.has(cleanId)) {
+      const idx = rowIndexMap.get(cleanId);
+      existingData[idx][2] = (Number(existingData[idx][2]) || 0) + qtyChange;
+    } else {
+      // 2. Schema Base Fallback for Non-8-Digit Materials
+      const parsedInput = parseCodeWithSchema(cleanId, db);
+      const baseId = parsedInput ? parsedInput.baseId : cleanId;
+      let matchedBaseIdx = -1;
+
+      if (cleanId.length !== 8) {
+        for (let j = 0; j < existingData.length; j++) {
+          const targetId = existingData[j][0].toString().toUpperCase().trim();
+          const parsedTarget = parseCodeWithSchema(targetId, db);
+          const targetBase = parsedTarget ? parsedTarget.baseId : targetId;
+
+          if (targetBase === baseId) {
+            matchedBaseIdx = j;
+            break;
+          }
+        }
+      }
+
+      if (matchedBaseIdx !== -1) {
+        existingData[matchedBaseIdx][2] = (Number(existingData[matchedBaseIdx][2]) || 0) + qtyChange;
+      } else {
+        // 3. Unmatched Item -> Append as New Row to Inventory with full ID
+        if (itemName === "Unknown Item") {
+          const priceSheet = db.getSheetByName("Master_Prices");
+          if (priceSheet && priceSheet.getLastRow() >= 2) {
+            const priceData = priceSheet.getRange(2, 1, priceSheet.getLastRow() - 1, 2).getValues();
+            for (let p = 0; p < priceData.length; p++) {
+              const mId = priceData[p][0].toString().toUpperCase().trim();
+              const mParsed = parseCodeWithSchema(mId, db);
+              if (mId === baseId || (mParsed && mParsed.baseId === baseId)) {
+                itemName = priceData[p][1];
+                break;
+              }
+            }
+          }
+        }
+        rowsToAppend.push([cleanId, itemName, Math.max(0, qtyChange)]);
+      }
+    }
+  }
+
+  // Single Write Operation for Updating Existing Rows
+  if (existingData.length > 0) {
+    invSheet.getRange(2, 1, existingData.length, 3).setValues(existingData);
+  }
+
+  // Single Write Operation for Appending New Items
+  if (rowsToAppend.length > 0) {
+    invSheet.getRange(invSheet.getLastRow() + 1, 1, rowsToAppend.length, 3).setValues(rowsToAppend);
+  }
+}
+
+// Note: Replaced by processBatchInventoryUpdates for mass-handling
+function updateBackendStock(db, itemId, qtyChange) {
+  const updates = {};
+  updates[itemId] = qtyChange;
+  processBatchInventoryUpdates(db, updates);
+}
+
+// Gathers active imperial tax regulations and parameters from the configurations sheet.
+function getTaxConfig(db) {
+  const configSheet = db.getSheetByName("Tax_Config");
+  const lastRow = configSheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const data = configSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+  const configs = [];
+
+  for (let i = 0; i < data.length; i++) {
+    configs.push({
+      name: data[i][0],
+      enabled: data[i][1] === true,
+      type: data[i][2].toString().trim(),
+      rate: Number(data[i][3]) || 0
+    });
+  }
+  return configs;
+}
+
+// Calculates dynamic percentage taxes against positive transaction profits and records them.
+function applyTransactionTaxes(db, referenceId, totalProfit, timestamp) {
+  if (totalProfit <= 0) return;
+
+  const taxLedger = db.getSheetByName("Tax_Ledger");
+  const taxConfigs = getTaxConfig(db);
+  const entriesToLog = [];
+
+  for (let i = 0; i < taxConfigs.length; i++) {
+    const tax = taxConfigs[i];
+    if (tax.enabled && tax.type === "% of Profits") {
+      const amountOwed = totalProfit * tax.rate;
+      if (amountOwed > 0) {
+        entriesToLog.push([timestamp, tax.name, tax.type, amountOwed, referenceId]);
+      }
+    }
+  }
+
+  if (entriesToLog.length > 0) {
+    // OPTIMIZATION: Batched append
+    taxLedger.getRange(taxLedger.getLastRow() + 1, 1, entriesToLog.length, entriesToLog[0].length).setValues(entriesToLog);
+  }
+}
+
+// Charges automated flat rate overhead tithes on a fixed weekly automated time trigger.
+function processWeeklyFlatTaxes() {
+  const db = getTreasuryDb();
+  const taxLedger = db.getSheetByName("Tax_Ledger");
+  const taxConfigs = getTaxConfig(db);
+  const timestamp = new Date();
+  const referenceId = `WEEKLY-${timestamp.getTime()}`;
+  const entriesToLog = [];
+
+  for (let i = 0; i < taxConfigs.length; i++) {
+    const tax = taxConfigs[i];
+    if (tax.enabled && tax.type === "Flat Weekly") {
+      entriesToLog.push([timestamp, tax.name, tax.type, tax.rate, referenceId]);
+    }
+  }
+  
+  if (entriesToLog.length > 0) {
+    // OPTIMIZATION: Batched append
+    taxLedger.getRange(taxLedger.getLastRow() + 1, 1, entriesToLog.length, entriesToLog[0].length).setValues(entriesToLog);
+  }
+}
+
+// --- KHAJIIT FLAVOR & TA'AGRA LOCALIZATION ---
+const UI_MESSAGES = Object.freeze({
+  
+  // --- SUCCESS DIALOGS ---
+  ORDER_PENDING: {
+    title: "🌙 Bright Moons!",
+    message: "This one has inked your order into the ledger. May Jode and Jone favor us. Status is set to **Pending** until the forge fires!"
+  },
+  
+  FULFILLMENT_COMPLETE: {
+    title: "✨ Vaba'zir!",
+    message: "It is done! The wares are crafted and delivered, and this one has subtracted the materials from the crates. Ja'fith khaja, trevan."
+  },
+  
+  HAGGLE_SUCCESS: {
+    title: "😸 A Fine Deal!",
+    message: "You speak with a silver tongue, daro! The price has been struck in your favor and updated in the ledger."
+  },
+  
+  MANAGER_SYNC_COMPLETE: {
+    title: "🐾 Counting Struck",
+    message: "The septims have been counted and synchronized across all ledgers. Even the Imperial tax collectors could find no fault here."
+  },
+
+  // --- ERROR & FAILURE DIALOGS ---
+  INSUFFICIENT_STOCK: {
+    title: "😿 Ziss't!",
+    message: "Khajiit looks deep into the storage crates and finds only cobwebs. We lack the rhakaj (materials) needed to complete this task!"
+  },
+  
+  UNAUTHORIZED_ACCESS: {
+    title: "😾 Halt, Renrij!",
+    message: "This one does not recognize your mark in the Users ledger. Step away from the caravan books before guards are summoned!"
+  },
+  
+  RECIPE_NOT_FOUND: {
+    title: "❓ What Craft is This?",
+    message: "Ziss! This one searched the old scrolls, but no recipe exists for this. Check your schema before trying again."
+  },
+  
+  INVALID_INPUT: {
+    title: "🐾 Soft Steps, Friend",
+    message: "This one cannot make sense of those numbers. Enter valid figures so Khajiit does not spill ink on the parchment."
+  }
+});
+
+// Helper function to trigger thematic UI Alerts
+function showKhajiitAlert(key, buttons) {
+  const ui = SpreadsheetApp.getUi();
+  const config = UI_MESSAGES[key] || {
+    title: "🐾 Notice",
+    message: "Khajiit has something to report, but lacks the words."
+  };
+  
+  const targetButtons = buttons || ui.ButtonSet.OK;
+  return ui.alert(config.title, config.message, targetButtons);
+}
