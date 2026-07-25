@@ -1,0 +1,321 @@
+// ==========================================
+// CONFIGURATION: PASTE YOUR TREASURY ID HERE
+// ==========================================
+var TREASURY_ID = "1ay9gid-z9_m7EchivU0axiTONUgxN2tRCnHpm6jStEs"; 
+
+/**
+ * Establishes a connection to the master remote database spreadsheet.
+ * @return {Spreadsheet} The open remote Treasury database object.
+ */
+function getTreasuryDb() {
+  return SpreadsheetApp.openById(TREASURY_ID);
+}
+
+/**
+ * Central event router tracking manager checkbox clicks to run data transfers.
+ * Triggers Pull sequences on Cell B1 and Push sequences on Cell B2.
+ * @param {Object} e - The Google Sheets automated edit event object.
+ */
+function installedManagerRouter(e) {
+  var range = e.range;
+  var sheet = range.getSheet();
+  var sheetName = sheet.getName().toLowerCase();
+  var row = range.getRow();
+  var col = range.getColumn();
+  var val = range.getValue();
+  
+  // Guard Clause: Only respond to checked boxes in Column B (Col 2)
+  if (val !== true || col !== 2) return; 
+  
+  // Route 1: Staff Configuration Control
+  if (sheetName.includes("staff_management")) {
+    if (row === 1) {
+      range.setValue(false); // Reset control checkbox immediately before execution
+      pullStaffData(sheet);
+    }
+    if (row === 2) {
+      range.setValue(false); 
+      pushStaffData(sheet);
+    }
+  }
+  
+  // Route 2: Master Catalog Price Control
+  else if (sheetName.includes("price_management")) {
+    if (row === 1) {
+      range.setValue(false);
+      pullPriceData(sheet);
+    }
+    if (row === 2) {
+      range.setValue(false);
+      pushPriceData(sheet);
+    }
+  }
+  
+  // Route 3: Kingdom Tax Control
+  else if (sheetName.includes("tax_management")) {
+    if (row === 1) {
+      range.setValue(false);
+      pullTaxData(sheet);
+    }
+    if (row === 2) {
+      range.setValue(false);
+      pushTaxData(sheet);
+    }
+  }
+}
+
+/**
+ * Downloads active staff profiles into the 6-column dashboard using the explicit layout.
+ * @param {Sheet} frontSheet - The active Staff_Management sheet object.
+ */
+function pullStaffData(frontSheet) {
+  var db = getTreasuryDb();
+  var userSheet = db.getSheetByName("Users");
+  var lastRow = userSheet.getLastRow();
+  
+  var frontLastRow = frontSheet.getLastRow();
+  // Clear all 6 dashboard columns (A-F) to prepare for data refresh
+  if (frontLastRow >= 5) frontSheet.getRange(5, 1, frontLastRow - 4, 6).clearContent(); 
+  if (lastRow < 2) return;
+  
+  var backendData = userSheet.getRange(2, 1, lastRow - 1, 8).getValues(); // Read backend columns A to H
+  var outputRows = [];
+  
+  for (var i = 0; i < backendData.length; i++) {
+    outputRows.push([
+      backendData[i][1], // Col B: staff name          -> Front Col A (Staff name)
+      backendData[i][4], // Col E: commission %       -> Front Col B (commission %)
+      backendData[i][5], // Col F: available comm     -> Front Col C (gold balance)
+      backendData[i][2], // Col C: role               -> Front Col D (role)
+      backendData[i][7], // Col H: active             -> Front Col E (active status)
+      backendData[i][3]  // Col D: notes              -> Front Col F (notes)
+    ]);
+  }
+  
+  if (outputRows.length > 0) {
+    frontSheet.getRange(5, 1, outputRows.length, 6).setValues(outputRows);
+  }
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert("📖 *The ledger rustles eagerly...* \n\n\"The ink bleeds and shifts at your command, mortal. The gold-scores, roles, and secret chronicles of your working thralls are laid bare upon my pages.\"");
+}
+
+/**
+ * Saves modified profiles and automatically generates systematic IDs for newly added lines.
+ * Backend emails are bypassed and remain untouched.
+ * @param {Sheet} frontSheet - The active Staff_Management sheet object.
+ */
+function pushStaffData(frontSheet) {
+  var db = getTreasuryDb();
+  var userSheet = db.getSheetByName("Users");
+  var backendLastRow = userSheet.getLastRow();
+  var frontLastRow = frontSheet.getLastRow();
+  
+  if (frontLastRow < 5) return;
+  
+  // Read all 6 columns from the dashboard layout (A to F)
+  var frontData = frontSheet.getRange(5, 1, frontLastRow - 4, 6).getValues(); 
+  var fullBackendData = backendLastRow >= 2 ? userSheet.getRange(2, 1, backendLastRow - 1, 8).getValues() : []; 
+  var backendNames = fullBackendData.map(function(r) { return r[1].toString().toLowerCase().trim(); }); // Col B is Name Anchor
+  
+  var newRowsToAppend = [];
+  var updated = false;
+  
+  for (var i = 0; i < frontData.length; i++) {
+    var rawName = frontData[i][0].toString().trim();
+    var nameAnchor = rawName.toLowerCase(); 
+    if (!nameAnchor) continue; 
+    
+    var matchIndex = backendNames.indexOf(nameAnchor);
+    if (matchIndex !== -1) {
+      // Existing Employee: Update records based on dashboard mapping
+      fullBackendData[matchIndex][2] = frontData[i][3]; // Col C: role            <- Front Col D
+      fullBackendData[matchIndex][3] = frontData[i][5]; // Col D: notes           <- Front Col F
+      fullBackendData[matchIndex][4] = frontData[i][1]; // Col E: commission %    <- Front Col B
+      fullBackendData[matchIndex][5] = frontData[i][2]; // Col F: available comm  <- Front Col C
+      fullBackendData[matchIndex][7] = frontData[i][4]; // Col H: active          <- Front Col E
+      // Note: fullBackendData[matchIndex][6] (Col G Email) is intentionally skipped
+      updated = true;
+    } else {
+      // New Employee Setup: Compute sequential ID schema (EMP-1001, EMP-1002, etc.)
+      var nextIdNum = 1001;
+      
+      // Check current database IDs to determine the absolute highest numeric index
+      for (var b = 0; b < fullBackendData.length; b++) {
+        var idVal = parseInt(fullBackendData[b][0].toString().replace(/\D/g, ""), 10);
+        if (!isNaN(idVal) && idVal >= nextIdNum) nextIdNum = idVal + 1;
+      }
+      // Track IDs of elements simultaneously being added in this exact batch loop
+      for (var n = 0; n < newRowsToAppend.length; n++) {
+        var idVal = parseInt(newRowsToAppend[n][0].toString().replace(/\D/g, ""), 10);
+        if (!isNaN(idVal) && idVal >= nextIdNum) nextIdNum = idVal + 1;
+      }
+      
+      var dynamicId = "EMP-" + nextIdNum;
+      
+      newRowsToAppend.push([
+        dynamicId,       // Col A: ID
+        rawName,         // Col B: staff name          <- Front Col A
+        frontData[i][3], // Col C: role                <- Front Col D
+        frontData[i][5], // Col D: notes               <- Front Col F
+        frontData[i][1], // Col E: commission %        <- Front Col B
+        frontData[i][2], // Col F: available comm      <- Front Col C
+        "",              // Col G: email               <- Left blank for backend
+        frontData[i][4]  // Col H: active              <- Front Col E
+      ]);
+    }
+  }
+  
+  // Commit updates to existing rows
+  if (fullBackendData.length > 0 && updated) {
+    userSheet.getRange(2, 1, fullBackendData.length, 8).setValues(fullBackendData);
+  }
+  
+  // Append new employee registration rows
+  for (var j = 0; j < newRowsToAppend.length; j++) {
+    userSheet.appendRow(newRowsToAppend[j]);
+  }
+  
+  SpreadsheetApp.flush(); 
+  SpreadsheetApp.getUi().alert("✨ *A faint purple glow emanates from the margins...* \n\n\"Mortal fates rewritten. New blood has been bound to the ledger, cataloged under precise identification marks. Their roles and deeds are securely recorded within the vault.\"");
+}
+
+/**
+ * Fetches the entire Master Prices database into the manager workspace grid.
+ */
+function pullPriceData(frontSheet) {
+  var db = getTreasuryDb();
+  var priceSheet = db.getSheetByName("Master_Prices");
+  var lastRow = priceSheet.getLastRow();
+  
+  var frontLastRow = frontSheet.getLastRow();
+  if (frontLastRow >= 5) frontSheet.getRange(5, 1, frontLastRow - 4, 4).clearContent();
+  if (lastRow < 2) return;
+  
+  var backendData = priceSheet.getRange(2, 1, lastRow - 1, 5).getValues();
+  var outputRows = [];
+  
+  for (var i = 0; i < backendData.length; i++) {
+    outputRows.push([
+      backendData[i][0], // Col A: Item ID
+      backendData[i][1], // Col B: Item Name
+      backendData[i][3], // Col D: Cost Price
+      backendData[i][4]  // Col E: Sell Price
+    ]);
+  }
+  
+  if (outputRows.length > 0) {
+    frontSheet.getRange(5, 1, outputRows.length, 4).setValues(outputRows);
+  }
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert("💰 *The sound of clinking Septims echoes from nowhere...* \n\n\"Ah, the sweet scent of commerce. I have reached into the deep, dark vault and summoned forth the hidden costs of every blade, potion, and trinket in the land.\"");
+}
+
+/**
+ * Processes price updates or appends newly drafted product line rows into the catalog vault.
+ */
+function pushPriceData(frontSheet) {
+  var db = getTreasuryDb();
+  var priceSheet = db.getSheetByName("Master_Prices");
+  var backendLastRow = priceSheet.getLastRow();
+  var frontLastRow = frontSheet.getLastRow();
+  
+  if (frontLastRow < 5) return;
+  
+  var frontData = frontSheet.getRange(5, 1, frontLastRow - 4, 4).getValues();
+  var fullBackendData = backendLastRow >= 2 ? priceSheet.getRange(2, 1, backendLastRow - 1, 5).getValues() : [];
+  var backendIds = fullBackendData.map(function(r) { return r[0].toString().toUpperCase().trim(); });
+  
+  var newRowsToAppend = [];
+  var updated = false;
+  
+  for (var i = 0; i < frontData.length; i++) {
+    var itemId = frontData[i][0].toString().toUpperCase().trim();
+    if (!itemId) continue;
+    
+    var matchIndex = backendIds.indexOf(itemId);
+    if (matchIndex !== -1) {
+      fullBackendData[matchIndex][1] = frontData[i][1]; // Col B: Item Name
+      fullBackendData[matchIndex][3] = frontData[i][2]; // Col D: Cost Price
+      fullBackendData[matchIndex][4] = frontData[i][3]; // Col E: Sell Price
+      updated = true;
+    } else {
+      newRowsToAppend.push([itemId, frontData[i][1], "", frontData[i][2], frontData[i][3]]);
+    }
+  }
+  
+  if (fullBackendData.length > 0 && updated) {
+    priceSheet.getRange(2, 1, fullBackendData.length, 5).setValues(fullBackendData);
+  }
+  
+  for (var j = 0; j < newRowsToAppend.length; j++) {
+    priceSheet.appendRow(newRowsToAppend[j]);
+  }
+  
+  SpreadsheetApp.flush(); 
+  SpreadsheetApp.getUi().alert("🛠️ *The script marks dry instantly...* \n\n\"It is done. The East Empire Company and local traders alike shall bend to your new terms. The absolute value of your steel and gold has been permanently etched into the grand catalog.\"");
+}
+
+/**
+ * Downloads active automated taxation frameworks and variables into the configuration sheet.
+ */
+function pullTaxData(frontSheet) {
+  var db = getTreasuryDb();
+  var taxSheet = db.getSheetByName("Tax_Config");
+  var lastRow = taxSheet.getLastRow();
+  
+  var frontLastRow = frontSheet.getLastRow();
+  if (frontLastRow >= 5) frontSheet.getRange(5, 1, frontLastRow - 4, 4).clearContent();
+  if (lastRow < 2) return;
+  
+  var data = taxSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+  if (data.length > 0) {
+    frontSheet.getRange(5, 1, data.length, 4).setValues(data);
+  }
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert("⚖️ *The pages grow heavy and smell faintly of brimstone...* \n\n\"The Jarl's greed... or perhaps your own? The grand tapestries of the realm's required tribute have uncoiled from the shadows and manifested upon my sheets.\"");
+}
+
+/**
+ * Commits modified taxation models, rate numbers, and active tracking variables back to the automation records.
+ */
+function pushTaxData(frontSheet) {
+  var db = getTreasuryDb();
+  var taxSheet = db.getSheetByName("Tax_Config");
+  var backendLastRow = taxSheet.getLastRow();
+  var frontLastRow = frontSheet.getLastRow();
+  
+  if (frontLastRow < 5) return;
+  
+  var frontData = frontSheet.getRange(5, 1, frontLastRow - 4, 4).getValues();
+  var fullBackendData = backendLastRow >= 2 ? taxSheet.getRange(2, 1, backendLastRow - 1, 4).getValues() : [];
+  var backendNames = fullBackendData.map(function(r) { return r[0].toString().trim(); });
+  
+  var newRowsToAppend = [];
+  var updated = false;
+  
+  for (var i = 0; i < frontData.length; i++) {
+    var taxName = frontData[i][0].toString().trim();
+    if (!taxName) continue;
+    
+    var matchIndex = backendNames.indexOf(taxName);
+    if (matchIndex !== -1) {
+      fullBackendData[matchIndex][1] = frontData[i][1]; // Col B: Enabled Checkbox
+      fullBackendData[matchIndex][2] = frontData[i][2]; // Col C: Calculation Type
+      fullBackendData[matchIndex][3] = frontData[i][3]; // Col D: Tax Rate Scale
+      updated = true;
+    } else {
+      newRowsToAppend.push([taxName, frontData[i][1], frontData[i][2], frontData[i][3]]);
+    }
+  }
+  
+  if (fullBackendData.length > 0 && updated) {
+    taxSheet.getRange(2, 1, fullBackendData.length, 4).setValues(fullBackendData);
+  }
+  
+  for (var j = 0; j < newRowsToAppend.length; j++) {
+    taxSheet.appendRow(newRowsToAppend[j]);
+  }
+  
+  SpreadsheetApp.flush(); 
+  SpreadsheetApp.getUi().alert("👑 *An ominous hum vibrates through the parchment...* \n\n\"Let the tax collectors ride forth! The new coin mandates are bound in ink and shadow. Whether they serve the Dragon or the Bear, the holds shall bleed their gold into your coffers.\"");
+}
